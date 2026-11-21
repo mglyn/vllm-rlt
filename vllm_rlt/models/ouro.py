@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from vllm_rlt.device import resolve_device
-from vllm_rlt.kernels import packed_silu_and_mul, silu_and_mul
+from vllm_rlt.kernels import ouro_mlp, silu_and_mul
 from vllm_rlt.layers import (
     RMSNorm,
     RotaryEmbedding,
@@ -190,27 +190,17 @@ class OuroAttention(nn.Module):
 class OuroMLP(nn.Module):
     def __init__(self, config: OuroConfig) -> None:
         super().__init__()
+        self.use_native_mlp = False
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.use_native_mlp:
+            return ouro_mlp(
+                hidden, self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight
+            )
         return self.down_proj(silu_and_mul(self.gate_proj(hidden), self.up_proj(hidden)))
-
-
-class PackedOuroMLP(nn.Module):
-    """Worker-owned inference layout, constructed once before graph capture."""
-
-    def __init__(self, source: OuroMLP) -> None:
-        super().__init__()
-        self.gate_up_weight = nn.Parameter(
-            torch.cat((source.gate_proj.weight, source.up_proj.weight)), requires_grad=False
-        )
-        self.down_proj = source.down_proj
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        gate_up = nn.functional.linear(hidden, self.gate_up_weight)
-        return self.down_proj(packed_silu_and_mul(gate_up))
 
 
 class OuroDecoderLayer(nn.Module):
@@ -269,12 +259,6 @@ class OuroForCausalLM(nn.Module):
             if isinstance(module, nn.Embedding) and module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
-
-    def pack_mlp_projections(self) -> None:
-        """Replace checkpoint-layout MLPs one layer at a time on the inference worker."""
-        for layer in self.model.layers:
-            if isinstance(layer.mlp, OuroMLP):
-                layer.mlp = PackedOuroMLP(layer.mlp).eval()
 
     def prelude(self, token_ids: torch.Tensor) -> torch.Tensor:
         if token_ids.ndim != 1:

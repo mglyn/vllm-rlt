@@ -7,6 +7,4 @@ namespace vllm_rlt {
 
 at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up);
 
-at::Tensor packed_silu_and_mul_cuda(const at::Tensor& input);
-
 }  // namespace vllm_rlt

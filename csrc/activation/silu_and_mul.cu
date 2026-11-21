@@ -215,53 +215,6 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// A projection row contains [gate | up]. Map each block to one tile in a
-// row so neither half has to be copied to a contiguous activation tensor.
-template <typename T, bool vectorized>
-__global__ void packed_silu_kernel(const T* input, T* out, int64_t width,
-                                   int64_t tiles_per_row) {
-  constexpr int elements = vectorized ? 16 / sizeof(T) : 1;
-  const int64_t row = blockIdx.x / tiles_per_row;
-  const int64_t col = ((blockIdx.x % tiles_per_row) * blockDim.x + threadIdx.x) * elements;
-  if (col >= width) return;
-  const T* gate = input + row * 2 * width + col;
-  T* result = out + row * width + col;
-  if constexpr (vectorized) {
-    const Vector<T> g = *reinterpret_cast<const Vector<T>*>(gate);
-    const Vector<T> u = *reinterpret_cast<const Vector<T>*>(gate + width);
-    Vector<T> value;
-#pragma unroll
-    for (int j = 0; j < 16 / sizeof(typename Math<T>::Pair); ++j) {
-      value.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
-    }
-    *reinterpret_cast<Vector<T>*>(result) = value;
-  } else {
-    *result = compute_scalar(*gate, gate[width]);
-  }
-}
-
-template <typename T>
-void launch_packed(const at::Tensor& input, at::Tensor& out) {
-  if (out.numel() == 0) return;
-  const auto* data = reinterpret_cast<const T*>(input.const_data_ptr());
-  auto* result = reinterpret_cast<T*>(out.mutable_data_ptr());
-  const int64_t width = out.size(-1);
-  const bool aligned = width % (16 / sizeof(T)) == 0 &&
-                       (reinterpret_cast<uintptr_t>(data) & 15) == 0;
-  constexpr int threads = 128;
-  const int items = threads * (aligned ? 16 / sizeof(T) : 1);
-  const int64_t tiles = (width + items - 1) / items;
-  const int64_t blocks = (out.numel() / width) * tiles;
-  TORCH_CHECK(blocks <= INT32_MAX, "packed_silu_and_mul: tensor too large");
-  auto stream = c10::cuda::getCurrentCUDAStream(input.get_device());
-  if (aligned) {
-    packed_silu_kernel<T, true><<<blocks, threads, 0, stream>>>(data, result, width, tiles);
-  } else {
-    packed_silu_kernel<T, false><<<blocks, threads, 0, stream>>>(data, result, width, tiles);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 }  // namespace
 
 at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up) {
@@ -289,24 +242,6 @@ at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up) {
     case at::kBFloat16: launch<__nv_bfloat16>(gate, up, out); break;
     case at::kFloat: launch<float>(gate, up, out); break;
     default: TORCH_CHECK(false, "unsupported dtype");
-  }
-  return out;
-}
-
-at::Tensor packed_silu_and_mul_cuda(const at::Tensor& input) {
-  TORCH_CHECK(input.dim() > 0 && input.size(-1) % 2 == 0 && input.is_contiguous(),
-              "packed_silu_and_mul expects contiguous input with an even final dimension");
-  TORCH_CHECK(!at::GradMode::is_enabled() || !input.requires_grad(),
-              "packed_silu_and_mul is inference-only");
-  const c10::cuda::CUDAGuard guard(input.device());
-  auto shape = input.sizes().vec();
-  shape.back() /= 2;
-  auto out = at::empty(shape, input.options());
-  switch (input.scalar_type()) {
-    case at::kHalf: launch_packed<__half>(input, out); break;
-    case at::kBFloat16: launch_packed<__nv_bfloat16>(input, out); break;
-    case at::kFloat: launch_packed<float>(input, out); break;
-    default: TORCH_CHECK(false, "packed_silu_and_mul supports float32, float16 and bfloat16");
   }
   return out;
 }

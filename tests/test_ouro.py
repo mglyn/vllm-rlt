@@ -11,8 +11,10 @@ from safetensors.torch import save_file
 
 from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
+from vllm_rlt.config import ExecutionConfig
+from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroConfig, OuroForCausalLM
-from vllm_rlt.models.ouro import OuroMLP, PackedOuroMLP
+from vllm_rlt.models.ouro import OuroMLP
 
 
 @pytest.fixture
@@ -21,18 +23,38 @@ def model():
     return OuroForCausalLM(tiny_ouro_config())
 
 
+def test_native_ouro_mlp_requires_cuda(model):
+    with pytest.raises(ValueError, match="requires a CUDA Ouro model"):
+        StageEngine(model, execution_config=ExecutionConfig(native_ouro_mlp=True))
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("rows", [1, 7, 32])
-def test_cuda_mlp_matches_torch_expression(dtype, rows):
+@pytest.mark.parametrize("native_mlp", [False, True])
+def test_cuda_mlp_matches_torch_expression(dtype, rows, native_mlp):
     torch.manual_seed(72)
     layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).to(device="cuda", dtype=dtype)
     layer.requires_grad_(False)
+    layer.use_native_mlp = native_mlp
     hidden = torch.randn(rows, layer.gate_proj.in_features, device="cuda", dtype=dtype)
     expected = layer.down_proj(
         torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
     )
-    torch.testing.assert_close(layer(hidden), expected, rtol=0, atol=0)
+    assert torch.equal(layer(hidden).view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.gpu
+def test_native_ouro_mlp_bits_at_real_decode_shape():
+    # Doubling the GEMM width changed BF16 bits at this shape on A100.
+    from transformers.activations import ACT2FN
+
+    torch.manual_seed(713)
+    layer = OuroMLP(OuroConfig()).to(device="cuda", dtype=torch.bfloat16).requires_grad_(False)
+    hidden = torch.randn(8, 2048, device="cuda", dtype=torch.bfloat16)
+    layer.use_native_mlp = True
+    expected = layer.down_proj(ACT2FN["silu"](layer.gate_proj(hidden)) * layer.up_proj(hidden))
+    assert torch.equal(layer(hidden).view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.gpu
@@ -65,13 +87,20 @@ def test_cuda_mlp_selects_native_or_missing_extension_fallback(native_available)
         names = {{event.key for event in prof.key_averages()}}
         assert 'vllm_rlt::silu_and_mul' in names
         assert ('aten::silu' in names) == (not {native_available})
+        layer.use_native_mlp = True
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            native_output = layer(hidden)
+        assert torch.equal(native_output.view(torch.uint8), expected.view(torch.uint8))
+        assert 'vllm_rlt::ouro_mlp' in {{event.key for event in prof.key_averages()}}
     """)
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=60)
 
 
 @pytest.mark.gpu
-def test_cuda_mlp_graph_replays_updated_hidden():
+@pytest.mark.parametrize("native_mlp", [False, True])
+def test_cuda_mlp_graph_replays_updated_hidden(native_mlp):
     layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).cuda().bfloat16().requires_grad_(False)
+    layer.use_native_mlp = native_mlp
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         hidden = torch.randn(3, layer.gate_proj.in_features, device="cuda", dtype=torch.bfloat16)
@@ -86,43 +115,7 @@ def test_cuda_mlp_graph_replays_updated_hidden():
     expected = layer.down_proj(
         torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
     )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_ouro_mlp_packing_preserves_weights_and_down_projection(model):
-    sources = [layer.mlp for layer in model.model.layers]
-    model.pack_mlp_projections()
-    packed = [layer.mlp for layer in model.model.layers]
-    model.pack_mlp_projections()
-    for layer, mlp, source in zip(model.model.layers, packed, sources):
-        assert isinstance(mlp, PackedOuroMLP)
-        assert layer.mlp is mlp and mlp.down_proj is source.down_proj
-        assert not mlp.gate_up_weight.requires_grad
-        gate, up = mlp.gate_up_weight.chunk(2)
-        torch.testing.assert_close(gate, source.gate_proj.weight, atol=0, rtol=0)
-        torch.testing.assert_close(up, source.up_proj.weight, atol=0, rtol=0)
-        hidden = torch.randn(4, gate.shape[-1])
-        torch.testing.assert_close(mlp(hidden), source(hidden))
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("width", [17, 64])
-def test_packed_ouro_mlp_graph_uses_updated_hidden(width):
-    source = OuroMLP(tiny_ouro_config(intermediate_size=width)).cuda().bfloat16()
-    source.requires_grad_(False)
-    mlp = PackedOuroMLP(source)
-    hidden = torch.randn(5, 32, device="cuda", dtype=torch.bfloat16)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        mlp(hidden)
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = mlp(hidden)
-    hidden.normal_()
-    graph.replay()
-    torch.testing.assert_close(output, source(hidden))
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])

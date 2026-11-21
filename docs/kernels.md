@@ -21,19 +21,16 @@ Add future kernels to the same extension and group sources by operation family.
 No backend registry or base class is required. Put future kernel performance
 benchmarks under `benchmarks/kernels/`.
 
-## Packed Ouro MLP on CUDA
+## Native Ouro MLP on CUDA
 
-Set `ExecutionConfig(pack_ouro_mlp=True)` or pass `--pack-ouro-mlp` to pack
-each layer's gate and up weights after loading the standard Ouro checkpoint.
-Startup temporarily requires space for one additional pair of projection weights.
-The MLP projects to `[..., 2 * intermediate_size]` in one GEMM. The optional
-native `packed_silu_and_mul` reads the gate and up halves of each contiguous
-row and writes the activation directly. The Torch fallback splits by view.
-The down projection consumes the resulting contiguous activation.
-
-This option defaults to false. Changing the GEMM shape can change floating-point
-rounding, greedy tokens and adaptive exit decisions. End-to-end measurements for
-the initial implementation cover BF16 Ouro-1.4B with four fixed loops on A100.
+Set `ExecutionConfig(native_ouro_mlp=True)` or pass `--native-ouro-mlp` to
+submit the MLP through one PyTorch operator. The CUDA extension calls the
+same three ATen linear operations at the same shapes as the HF Ouro MLP.
+On SM80 it uses the existing fused SiLU-and-multiply for BF16, including
+rounding SiLU to BF16 before multiplication. Other GPU architectures, dtypes
+and installations without the extension use the HF Torch activation expression. The option defaults to false.
+Checkpoint weights stay in their original layout. CUDA Graph replay executes
+the same BF16 kernels as the original RLT MLP on SM80.
 
 ## SiLU-and-Mul contract and current status
 

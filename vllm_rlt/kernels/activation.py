@@ -28,13 +28,10 @@ def silu_and_mul_reference(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor
     return F.silu(gate) * up
 
 
-def _packed_silu_and_mul_reference(input: torch.Tensor) -> torch.Tensor:
-    if input.ndim == 0 or input.shape[-1] % 2 or not input.is_contiguous():
-        raise ValueError(
-            "packed_silu_and_mul expects contiguous input with an even final dimension"
-        )
-    gate, up = input.chunk(2, dim=-1)
-    return silu_and_mul_reference(gate, up)
+def _ouro_mlp_reference(hidden, gate_weight, up_weight, down_weight):
+    gate = F.linear(hidden, gate_weight)
+    up = F.linear(hidden, up_weight)
+    return F.linear(F.silu(gate) * up, down_weight)
 
 
 # Keep the library alive: Python registrations are removed when it is destroyed.
@@ -42,11 +39,14 @@ def _packed_silu_and_mul_reference(input: torch.Tensor) -> torch.Tensor:
 # installations without the optional extension use the same schema and fallback.
 _library = torch.library.Library("vllm_rlt", "FRAGMENT")
 if not try_load_extension():
-    _library.define("packed_silu_and_mul(Tensor input) -> Tensor")
+    _library.define(
+        "ouro_mlp(Tensor hidden, Tensor gate_weight, Tensor up_weight, "
+        "Tensor down_weight) -> Tensor"
+    )
     _library.define("silu_and_mul(Tensor gate, Tensor up) -> Tensor")
 _library.impl("silu_and_mul", silu_and_mul_reference, "CompositeExplicitAutograd")
 
-silu_and_mul = torch.ops.vllm_rlt.silu_and_mul
+_library.impl("ouro_mlp", _ouro_mlp_reference, "CompositeImplicitAutograd")
 
-_library.impl("packed_silu_and_mul", _packed_silu_and_mul_reference, "CompositeExplicitAutograd")
-packed_silu_and_mul = torch.ops.vllm_rlt.packed_silu_and_mul
+ouro_mlp = torch.ops.vllm_rlt.ouro_mlp
+silu_and_mul = torch.ops.vllm_rlt.silu_and_mul

@@ -91,7 +91,7 @@ in mixed prefill/decode batches.
 - **Configurable execution:** Torch reference execution, GPU attention backends,
   CUDA Graphs, and optional asynchronous/speculative paths. An optional native
   CUDA SiLU-and-Mul operator accelerates the Ouro activation path, with a Torch
-  fallback. CUDA Ouro also supports [opt-in gate/up projection packing](docs/kernels.md#packed-ouro-mlp-on-cuda).
+  fallback. CUDA Ouro also supports [an opt-in native MLP](docs/kernels.md#native-ouro-mlp-on-cuda).
 - **Offline and online use:** Python API, CLI, and a streaming
   OpenAI-compatible **completions** endpoint. This is not a chat-completions API.
 

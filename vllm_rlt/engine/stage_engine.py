@@ -76,10 +76,13 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
-        if self.execution_config.pack_ouro_mlp:
-            if parameter.device.type != "cuda" or not isinstance(model, OuroForCausalLM):
-                raise ValueError("pack_ouro_mlp requires a CUDA Ouro model")
-            model.pack_mlp_projections()
+        if self.execution_config.native_ouro_mlp and (
+            parameter.device.type != "cuda" or not isinstance(model, OuroForCausalLM)
+        ):
+            raise ValueError("native_ouro_mlp requires a CUDA Ouro model")
+        if isinstance(model, OuroForCausalLM):
+            for layer in model.model.layers:
+                layer.mlp.use_native_mlp = self.execution_config.native_ouro_mlp
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
