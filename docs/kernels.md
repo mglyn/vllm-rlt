@@ -21,6 +21,20 @@ Add future kernels to the same extension and group sources by operation family.
 No backend registry or base class is required. Put future kernel performance
 benchmarks under `benchmarks/kernels/`.
 
+## Packed Ouro MLP on CUDA
+
+Set `ExecutionConfig(pack_ouro_mlp=True)` or pass `--pack-ouro-mlp` to pack
+each layer's gate and up weights after loading the standard Ouro checkpoint.
+Startup temporarily requires space for one additional pair of projection weights.
+The MLP projects to `[..., 2 * intermediate_size]` in one GEMM. The optional
+native `packed_silu_and_mul` reads the gate and up halves of each contiguous
+row and writes the activation directly. The Torch fallback splits by view.
+The down projection consumes the resulting contiguous activation.
+
+This option defaults to false. Changing the GEMM shape can change floating-point
+rounding, greedy tokens and adaptive exit decisions. End-to-end measurements for
+the initial implementation cover BF16 Ouro-1.4B with four fixed loops on A100.
+
 ## SiLU-and-Mul contract and current status
 
 `silu_and_mul_reference(gate, up)` computes `F.silu(gate) * up`. The inputs have

@@ -28,12 +28,25 @@ def silu_and_mul_reference(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor
     return F.silu(gate) * up
 
 
+def _packed_silu_and_mul_reference(input: torch.Tensor) -> torch.Tensor:
+    if input.ndim == 0 or input.shape[-1] % 2 or not input.is_contiguous():
+        raise ValueError(
+            "packed_silu_and_mul expects contiguous input with an even final dimension"
+        )
+    gate, up = input.chunk(2, dim=-1)
+    return silu_and_mul_reference(gate, up)
+
+
 # Keep the library alive: Python registrations are removed when it is destroyed.
 # Native CUDA takes precedence over the composite Torch implementation; CPU and
 # installations without the optional extension use the same schema and fallback.
 _library = torch.library.Library("vllm_rlt", "FRAGMENT")
 if not try_load_extension():
+    _library.define("packed_silu_and_mul(Tensor input) -> Tensor")
     _library.define("silu_and_mul(Tensor gate, Tensor up) -> Tensor")
 _library.impl("silu_and_mul", silu_and_mul_reference, "CompositeExplicitAutograd")
 
 silu_and_mul = torch.ops.vllm_rlt.silu_and_mul
+
+_library.impl("packed_silu_and_mul", _packed_silu_and_mul_reference, "CompositeExplicitAutograd")
+packed_silu_and_mul = torch.ops.vllm_rlt.packed_silu_and_mul

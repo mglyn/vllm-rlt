@@ -21,6 +21,7 @@ from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.kernels.paged_attention import PackedWindowShape
+from vllm_rlt.models.ouro import OuroForCausalLM
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import DEFAULT_MIN_LOOPS, SamplingParams
@@ -75,6 +76,10 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if self.execution_config.pack_ouro_mlp:
+            if parameter.device.type != "cuda" or not isinstance(model, OuroForCausalLM):
+                raise ValueError("pack_ouro_mlp requires a CUDA Ouro model")
+            model.pack_mlp_projections()
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")

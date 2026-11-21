@@ -160,11 +160,14 @@ class ExecutionConfig:
     # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
     # support and compatible synchronous eager execution; off otherwise.
     packed_prefill: bool | None = None
+    # A wider Ouro GEMM can change BF16 rounding and greedy tokens.
+    pack_ouro_mlp: bool = False
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
             raise ValueError("packed_prefill must be a boolean or None")
         for name in (
+            "pack_ouro_mlp",
             "use_uva",
             "async_scheduling",
             "multi_stream",

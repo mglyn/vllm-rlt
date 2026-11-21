@@ -12,7 +12,7 @@ from safetensors.torch import save_file
 from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
 from vllm_rlt.models import OuroConfig, OuroForCausalLM
-from vllm_rlt.models.ouro import OuroMLP
+from vllm_rlt.models.ouro import OuroMLP, PackedOuroMLP
 
 
 @pytest.fixture
@@ -87,6 +87,42 @@ def test_cuda_mlp_graph_replays_updated_hidden():
         torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_ouro_mlp_packing_preserves_weights_and_down_projection(model):
+    sources = [layer.mlp for layer in model.model.layers]
+    model.pack_mlp_projections()
+    packed = [layer.mlp for layer in model.model.layers]
+    model.pack_mlp_projections()
+    for layer, mlp, source in zip(model.model.layers, packed, sources):
+        assert isinstance(mlp, PackedOuroMLP)
+        assert layer.mlp is mlp and mlp.down_proj is source.down_proj
+        assert not mlp.gate_up_weight.requires_grad
+        gate, up = mlp.gate_up_weight.chunk(2)
+        torch.testing.assert_close(gate, source.gate_proj.weight, atol=0, rtol=0)
+        torch.testing.assert_close(up, source.up_proj.weight, atol=0, rtol=0)
+        hidden = torch.randn(4, gate.shape[-1])
+        torch.testing.assert_close(mlp(hidden), source(hidden))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("width", [17, 64])
+def test_packed_ouro_mlp_graph_uses_updated_hidden(width):
+    source = OuroMLP(tiny_ouro_config(intermediate_size=width)).cuda().bfloat16()
+    source.requires_grad_(False)
+    mlp = PackedOuroMLP(source)
+    hidden = torch.randn(5, 32, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mlp(hidden)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = mlp(hidden)
+    hidden.normal_()
+    graph.replay()
+    torch.testing.assert_close(output, source(hidden))
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])

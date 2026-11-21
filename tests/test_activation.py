@@ -11,7 +11,7 @@ from itertools import product
 import pytest
 import torch
 
-from vllm_rlt.kernels.activation import silu_and_mul, silu_and_mul_reference
+from vllm_rlt.kernels.activation import packed_silu_and_mul, silu_and_mul, silu_and_mul_reference
 
 
 def test_missing_native_extension_allows_optional_selection_but_not_explicit_load(monkeypatch):
@@ -428,3 +428,26 @@ def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offsets):
     assert torch.equal(actual_patterns[valid].view(torch.int16), expected[valid].view(torch.int16))
     expected_tail = silu_and_mul_reference(gate[-1:], up[-1:])
     torch.testing.assert_close(actual[-1:], expected_tail, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,offset",
+    [((0, 32), 0), ((2, 0), 0), ((3, 2, 32), 0), ((3, 32), 1), ((5, 34), 0), ((2,), 0)],
+)
+def test_packed_silu_reads_both_halves_of_each_row(device, dtype, shape, offset):
+    data = torch.randn(math.prod(shape) + offset, dtype=dtype, device=device)[offset:].view(shape)
+    gate, up = data.chunk(2, dim=-1)
+    expected = (
+        silu_and_mul(gate.contiguous(), up.contiguous())
+        if device == "cuda"
+        else silu_and_mul_reference(gate, up)
+    )
+    torch.testing.assert_close(packed_silu_and_mul(data), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("input", [torch.empty(()), torch.empty(2, 3), torch.empty(4, 2).T])
+def test_packed_silu_rejects_incompatible_layout(input):
+    with pytest.raises(ValueError, match="contiguous input with an even final dimension"):
+        packed_silu_and_mul(input)
